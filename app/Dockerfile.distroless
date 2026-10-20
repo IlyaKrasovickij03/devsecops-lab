@@ -1,0 +1,45 @@
+# Индивидуальное задание 1: образ с минимальной поверхностью атаки.
+# Многоэтапная сборка: всё, что нужно только для установки зависимостей,
+# остаётся в первом этапе и в финальный образ не попадает.
+
+# ---------- Этап 1: сборка зависимостей ----------
+FROM python:3.13-slim-trixie AS builder
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+COPY requirements.txt .
+
+# --target кладёт пакеты в один каталог, который легко скопировать целиком
+RUN pip install --no-cache-dir --target=/build/deps -r requirements.txt
+
+# ---------- Этап 2: финальный образ ----------
+# distroless: нет пакетного менеджера, нет shell, нет coreutils.
+# Внутри только интерпретатор Python и системные библиотеки, нужные ему.
+FROM gcr.io/distroless/python3-debian13
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/deps:/app
+
+WORKDIR /app
+
+# Из первого этапа переносим только установленные зависимости
+COPY --from=builder /build/deps /app/deps
+COPY app.py .
+
+# Пользователь задан числом: в distroless нет /etc/passwd с именами,
+# а USER по имени потребовал бы его создания
+USER 10001
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["python3", "-c", \
+       "import urllib.request as u; u.urlopen('http://localhost:5000/health')"]
+
+# Запуск модулем: консольный скрипт gunicorn потребовал бы shell-обёртки
+ENTRYPOINT ["python3", "-m", "gunicorn"]
+CMD ["--bind", "0.0.0.0:5000", "--workers", "2", \
+     "--access-logfile", "-", "app:app"]

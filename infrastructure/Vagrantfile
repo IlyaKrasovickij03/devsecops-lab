@@ -1,0 +1,138 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Индивидуальное задание 2: после `vagrant destroy -f && vagrant up`
+# машина полностью готова к работе без единого ручного действия внутри неё.
+#
+# Отличие от листинга методички: провайдер qemu вместо virtualbox.
+# Причина — хост на Apple Silicon (arm64). VirtualBox для ARM не запускает
+# боксы amd64, а бокс ubuntu/jammy64 из методички собран только под amd64.
+# Методичка этот случай предусматривает и разрешает другой провайдер
+# (раздел «Особенности платформ»). Логика работы при этом не меняется:
+# внутри VM тот же Ubuntu 22.04, тот же Docker, тот же реестр.
+
+TRIVY_VERSION = "0.74.0"
+REGISTRY_PORT = 5000      # порт реестра внутри VM
+APP_PORT      = 8080      # порт приложения внутри VM
+
+Vagrant.configure("2") do |config|
+  # Бокс Ubuntu 22.04 под arm64 для провайдера qemu
+  config.vm.box = "perk/ubuntu-2204-arm64"
+  config.vm.box_check_update = false
+
+  config.vm.hostname = "devsecops-vm"
+
+  # Провайдер qemu работает через user-mode networking, фиксированный адрес
+  # host-only сети недоступен. Доступ с хоста идёт через проброс портов:
+  #   localhost:8080  -> приложение в VM
+  #   localhost:15000 -> реестр в VM
+  # Порт 5000 на хосте не используется: в macOS его занимает AirPlay Receiver,
+  # о чём методичка предупреждает отдельно.
+  config.vm.network "forwarded_port", guest: APP_PORT, host: 8080, host_ip: "127.0.0.1"
+  config.vm.network "forwarded_port", guest: REGISTRY_PORT, host: 15000, host_ip: "127.0.0.1"
+
+  # Код проекта попадает в VM в /home/vagrant/devsecops-lab.
+  # Тип rsync: общие папки VirtualBox недоступны при провайдере qemu.
+  config.vm.synced_folder "..", "/home/vagrant/devsecops-lab",
+    type: "rsync",
+    rsync__exclude: [".git/", ".vagrant/", "reports/", "__pycache__/", ".venv/"]
+
+  # config.ssh.insert_key НЕ отключаем: Vagrant создаст для VM
+  # собственную пару ключей вместо общеизвестного "insecure key"
+
+  config.vm.provider "qemu" do |qe|
+    qe.arch         = "aarch64"
+    qe.machine      = "virt,accel=hvf,highmem=on"
+    qe.cpu          = "host"
+    qe.smp          = "2"
+    qe.memory       = "2048"
+    qe.net_device   = "virtio-net-pci"
+  end
+
+  # ---------------------------------------------------------------- Docker
+  config.vm.provision "docker", type: "shell", inline: <<-SHELL
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    if ! command -v docker >/dev/null 2>&1; then
+      apt-get update
+      apt-get install -y docker.io docker-buildx curl
+    fi
+
+    # Docker без sudo - только для пользователя vagrant.
+    # Помните: членство в группе docker фактически равно правам root
+    usermod -aG docker vagrant
+
+    # Разрешаем HTTP-доступ к учебному реестру (только для учебной сети!).
+    # localhost Docker и так считает доверенным, ключ оставлен явно,
+    # чтобы конфигурация читалась однозначно.
+    mkdir -p /etc/docker
+    echo '{ "insecure-registries": ["localhost:#{REGISTRY_PORT}"] }' > /etc/docker/daemon.json
+
+    systemctl enable docker
+    systemctl restart docker
+  SHELL
+
+  # ----------------------------------------------------------------- Trivy
+  # Фиксированная версия с проверкой контрольной суммы.
+  # Повторный provision ничего не скачивает, если версия уже та.
+  config.vm.provision "trivy", type: "shell", inline: <<-SHELL
+    set -euo pipefail
+
+    WANT="#{TRIVY_VERSION}"
+    HAVE="$(trivy --version 2>/dev/null | awk '/^Version:/ {print $2}' || true)"
+    if [ "$HAVE" = "$WANT" ]; then
+      echo "Trivy ${WANT} уже установлен, пропускаем"
+      exit 0
+    fi
+
+    ARCH="$(dpkg --print-architecture)"
+    case "$ARCH" in
+      arm64) ASSET="Linux-ARM64" ;;
+      amd64) ASSET="Linux-64bit" ;;
+      *) echo "неизвестная архитектура: $ARCH" >&2; exit 1 ;;
+    esac
+
+    TMP="$(mktemp -d)"
+    cd "$TMP"
+    BASE="https://github.com/aquasecurity/trivy/releases/download/v${WANT}"
+    curl -sSfLO "${BASE}/trivy_${WANT}_${ASSET}.tar.gz"
+    curl -sSfLO "${BASE}/trivy_${WANT}_checksums.txt"
+
+    # Контрольная сумма обязательна: в марте 2026 в обращение попали
+    # вредоносные сборки Trivy 0.69.4-0.69.6 (CVE-2026-33634)
+    sha256sum --ignore-missing -c "trivy_${WANT}_checksums.txt"
+
+    tar -xzf "trivy_${WANT}_${ASSET}.tar.gz" trivy
+    install -m 0755 trivy /usr/local/bin/trivy
+    cd / && rm -rf "$TMP"
+    trivy --version
+  SHELL
+
+  # --------------------------------------------------------------- Реестр
+  # Запускается автоматически и переживает перезагрузку VM благодаря
+  # --restart=always; образы лежат в именованном томе и переживают
+  # пересоздание самого контейнера.
+  config.vm.provision "registry", type: "shell", inline: <<-SHELL
+    set -euo pipefail
+
+    if docker ps -a --format '{{.Names}}' | grep -qx registry; then
+      docker start registry >/dev/null 2>&1 || true
+      echo "реестр уже существует, повторно не создаём"
+    else
+      docker run -d --name registry --restart=always \
+        -p #{REGISTRY_PORT}:5000 -v registry-data:/var/lib/registry registry:3
+    fi
+
+    docker ps --filter name=registry
+  SHELL
+
+  # ------------------------------------------------- Python для тестов
+  config.vm.provision "python", type: "shell", inline: <<-SHELL
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    if ! dpkg -s python3-venv >/dev/null 2>&1; then
+      apt-get install -y python3-venv python3-pip
+    fi
+  SHELL
+end
