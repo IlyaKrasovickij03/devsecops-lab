@@ -14,9 +14,19 @@ RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app \
       --no-create-home --shell /usr/sbin/nologin app
 
-# Сначала зависимости (слой лучше кэшируется), затем код
+# Сначала зависимости (слой лучше кэшируется), затем код.
+# После установки удаляем сам pip и setuptools: в их встроенных (vendored)
+# копиях msgpack и urllib3, а также в setuptools есть исправимые уязвимости
+# уровня HIGH, которые приезжают вместе с базовым образом. Приложению
+# в рантайме pip не нужен - значит, он только увеличивает поверхность атаки.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && PY=/usr/local/lib/python3.13 \
+ && rm -rf "$PY/site-packages/pip" "$PY"/site-packages/pip-* \
+           "$PY/site-packages/setuptools" "$PY"/site-packages/setuptools-* \
+           "$PY/site-packages/pkg_resources" \
+           "$PY/ensurepip" \
+ && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13
 
 # Код остается во владении root: процесс приложения
 # сможет его читать, но не сможет изменить
